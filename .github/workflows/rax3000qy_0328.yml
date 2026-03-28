@@ -215,7 +215,7 @@ jobs:
         name: OpenWrt_firmware_RAX3000QY_${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
-    # 注意：已完全移除 Release 相关步骤
+    # 注意：已完全移除 Release 
     # - 不需要 Generate release tag
     # - 不需要 Upload firmware to release
     # - 不需要 Remove old Releases
