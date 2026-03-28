@@ -1,13 +1,3 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://githubfast.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
 name: Build RAX30000QY QSDK12.5
 
 on:
@@ -19,7 +9,9 @@ on:
         required: false
         default: 'false'
 
-env:  
+env:
+  # 强制 actions 使用 Node.js 24
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_URL: https://github.com/everything411/qsdk
   REPO_BRANCH: 12.5.2783.2994
   FEEDS_CONF: feeds.conf.default
@@ -28,7 +20,7 @@ env:
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: false  # 改为 false，不上传到 Release
+  UPLOAD_RELEASE: false
   TZ: Asia/Shanghai
 
 jobs:
@@ -37,7 +29,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4  # 升级到 v4，支持 Node.js 24
+      uses: actions/checkout@v4
 
     - name: Initialization environment
       env:
@@ -50,6 +42,10 @@ jobs:
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
+        
+        # 初始空间检查
+        echo "=== Initial disk space ==="
+        df -h
         
     - name: Clone source code
       working-directory: /workdir
@@ -137,8 +133,23 @@ jobs:
         echo "uci-defaults script created:"
         cat package/base-files/files/etc/uci-defaults/99_set_lan_ip
         echo ""
-        echo "config_generate IP lines:"
-        grep -n "192.168" package/base-files/files/bin/config_generate 2>/dev/null || echo "config_generate not found or no 192.168 entries"
+        
+    # ========== 空间清理步骤 1: 下载前清理 ==========
+    - name: Clean before download
+      run: |
+        echo "=== Cleaning before download ==="
+        cd openwrt
+        
+        # 清理旧的下载缓存（保留最近3天）
+        find dl -type f -atime +3 -delete 2>/dev/null || true
+        
+        # 清理临时文件
+        rm -rf tmp/*
+        rm -rf staging_dir/*
+        rm -rf build_dir/target-* 2>/dev/null || true
+        
+        echo "Space after cleaning:"
+        df -h .
         
     - name: Download package
       id: package
@@ -149,74 +160,137 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
         
+    # ========== 空间清理步骤 2: 下载后清理 ==========
+    - name: Clean after download
+      run: |
+        echo "=== Cleaning after download ==="
+        cd openwrt
+        
+        # 清理不需要的下载文件
+        find dl -name "*.tmp" -delete
+        find dl -name "*.lock" -delete
+        
+        # 清理 git 临时文件
+        find . -name ".git" -type d -prune -exec rm -rf {} \; 2>/dev/null || true
+        
+        echo "Space after download cleaning:"
+        df -h .
+        
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        
+        # 限制并行编译数，避免内存不足
+        make -j$(($(nproc) / 2 + 1)) || make -j1 || make -j1 V=s
+        
         echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         
+    # ========== 空间清理步骤 3: 编译后清理 ==========
+    - name: Clean after compilation
+      if: always()
+      run: |
+        echo "=== Cleaning after compilation ==="
+        cd openwrt
+        
+        # 删除编译中间文件，只保留最终固件
+        rm -rf build_dir/target-*/*/{.pkgdir,.built,*.o,*.a,*.so} 2>/dev/null || true
+        rm -rf staging_dir/target-*/* 2>/dev/null || true
+        rm -rf staging_dir/host/bin 2>/dev/null || true
+        rm -rf tmp/.config* 2>/dev/null || true
+        
+        # 清理日志文件
+        find . -name "*.log" -size +10M -delete 2>/dev/null || true
+        find . -name "*.log.*" -delete 2>/dev/null || true
+        
+        # 清理符号链接和临时文件
+        find . -type l -xtype l -delete 2>/dev/null || true
+        
+        echo "Space after compilation cleaning:"
+        df -h .
+        
     - name: Check space usage
       if: (!cancelled())
-      run: df -hT
+      run: |
+        echo "=== Final disk space usage ==="
+        df -hT
+        echo ""
+        echo "=== Largest directories in openwrt ==="
+        du -sh openwrt/* 2>/dev/null | sort -hr | head -10
 
     - name: List build output (Debug)
       if: always()
       run: |
-        echo "=== Build output directories ==="
-        find openwrt/bin -type d 2>/dev/null || echo "bin directory not found"
-        echo "=== Firmware files ==="
-        find openwrt/bin -name "*.bin" -o -name "*.img" -o -name "*.ubi" 2>/dev/null || echo "No firmware files found"
-        echo "=== Directory structure ==="
-        ls -la openwrt/bin/targets/ 2>/dev/null || echo "Targets directory not found"
+        echo "=== Check if build produced any files ==="
+        if [ -d "openwrt/bin" ]; then
+          echo "bin directory exists, contents:"
+          ls -la openwrt/bin/
+          echo ""
+          echo "=== Searching for firmware files ==="
+          find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.trx" \) -ls || echo "No firmware files found"
+          echo ""
+          echo "=== Firmware file sizes ==="
+          find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" \) -exec ls -lh {} \; || echo "No firmware files found"
+        else
+          echo "ERROR: openwrt/bin directory not found!"
+          echo "Build likely failed. Check compile step logs."
+        fi
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@v4  # 升级到 v4
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+    - name: Upload bin directory (for debugging)
+      uses: actions/upload-artifact@v4
+      if: always() && steps.compile.outputs.status == 'success'
       with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        name: OpenWrt_full_bin_${{ env.FILE_DATE }}
         path: openwrt/bin
 
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
-        # 查找实际的固件目录
-        FIRMWARE_DIR=$(find openwrt/bin/targets -type d -name "generic" 2>/dev/null | head -1)
+        # 查找固件文件
+        FIRMWARE_FILE=$(find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" \) | head -1)
         
-        # 如果找不到 generic，尝试查找任何包含固件的目录
-        if [ -z "$FIRMWARE_DIR" ]; then
-          FIRMWARE_DIR=$(find openwrt/bin/targets -type f -name "*.bin" 2>/dev/null | head -1 | xargs dirname)
-        fi
-        
-        if [ -n "$FIRMWARE_DIR" ] && [ -d "$FIRMWARE_DIR" ]; then
-          cd "$FIRMWARE_DIR"
-          rm -rf packages
-          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
-          echo "Found firmware at: $PWD"
-          echo "Firmware files:"
-          ls -la *.bin 2>/dev/null || ls -la
-        else
-          echo "Firmware directory not found! Checking available paths:"
-          find openwrt/bin/targets -type d 2>/dev/null || echo "No targets found"
+        if [ -z "$FIRMWARE_FILE" ]; then
+          echo "❌ No firmware files found in openwrt/bin!"
+          echo "Available files in bin:"
+          find openwrt/bin -type f 2>/dev/null || echo "  (none)"
           echo "status=failed" >> $GITHUB_OUTPUT
           exit 1
         fi
         
+        FIRMWARE_DIR=$(dirname "$FIRMWARE_FILE")
+        cd "$FIRMWARE_DIR"
+        rm -rf packages 2>/dev/null || true
+        
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ Found firmware at: $PWD"
+        echo "Firmware files:"
+        ls -la
+
     - name: Upload firmware directory
-      uses: actions/upload-artifact@v4  # 升级到 v4
+      uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware_RAX3000QY_${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
-
-    # 注意：已完全移除 Release 相关步骤
-    # - 不需要 Generate release tag
-    # - 不需要 Upload firmware to release
-    # - 不需要 Remove old Releases
-    # - 不需要 Delete old workflow runs
+        
+    # ========== 最终清理步骤 ==========
+    - name: Final cleanup
+      if: always()
+      run: |
+        echo "=== Final cleanup ==="
+        # 删除工作目录释放空间
+        sudo rm -rf /workdir
+        sudo rm -rf openwrt
+        
+        # 清理 apt 缓存
+        sudo apt clean
+        sudo apt autoremove -y
+        
+        echo "Final disk space:"
+        df -h
