@@ -1,3 +1,13 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://githubfast.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
 name: Build RAX30000QY QSDK12.5
 
 on:
@@ -10,7 +20,7 @@ on:
         default: 'false'
 
 env:
-  # 强制 actions 使用 Node.js 24
+  # 强制 actions 使用 Node.js 24（解决 Node.js 20 弃用警告）
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_URL: https://github.com/everything411/qsdk
   REPO_BRANCH: 12.5.2783.2994
@@ -101,13 +111,7 @@ jobs:
         
         EOF
         
-        # 方法1: 修改 config_generate 文件（如果存在）
-        if [ -f "package/base-files/files/bin/config_generate" ]; then
-          echo "Modifying LAN IP in config_generate"
-          sed -i 's/192.168.1.1/192.168.66.1/g' package/base-files/files/bin/config_generate
-        fi
-        
-        # 方法2: 创建 uci-defaults 脚本（最可靠的方法）
+        # 创建 uci-defaults 脚本（最可靠的方法）
         echo "Creating uci-defaults script to set LAN IP"
         mkdir -p package/base-files/files/etc/uci-defaults
         cat > package/base-files/files/etc/uci-defaults/99_set_lan_ip << 'EOF'
@@ -122,34 +126,12 @@ jobs:
         EOF
         chmod +x package/base-files/files/etc/uci-defaults/99_set_lan_ip
         
-        # 方法3: 修改 package/base-files 中的默认配置
-        if [ -f "package/base-files/files/lib/functions/uci-defaults.sh" ]; then
-          echo "Also patching uci-defaults.sh"
-          sed -i 's/192.168.1.1/192.168.66.1/g' package/base-files/files/lib/functions/uci-defaults.sh 2>/dev/null || true
+        # 也修改 config_generate（如果存在）
+        if [ -f "package/base-files/files/bin/config_generate" ]; then
+          sed -i 's/192.168.1.1/192.168.66.1/g' package/base-files/files/bin/config_generate
         fi
         
-        # 验证修改
-        echo "=== LAN IP modification summary ==="
-        echo "uci-defaults script created:"
-        cat package/base-files/files/etc/uci-defaults/99_set_lan_ip
-        echo ""
-        
-    # ========== 空间清理步骤 1: 下载前清理 ==========
-    - name: Clean before download
-      run: |
-        echo "=== Cleaning before download ==="
-        cd openwrt
-        
-        # 清理旧的下载缓存（保留最近3天）
-        find dl -type f -atime +3 -delete 2>/dev/null || true
-        
-        # 清理临时文件
-        rm -rf tmp/*
-        rm -rf staging_dir/*
-        rm -rf build_dir/target-* 2>/dev/null || true
-        
-        echo "Space after cleaning:"
-        df -h .
+        echo "✅ LAN IP set to 192.168.66.1"
         
     - name: Download package
       id: package
@@ -160,137 +142,129 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
         
-    # ========== 空间清理步骤 2: 下载后清理 ==========
-    - name: Clean after download
-      run: |
-        echo "=== Cleaning after download ==="
-        cd openwrt
-        
-        # 清理不需要的下载文件
-        find dl -name "*.tmp" -delete
-        find dl -name "*.lock" -delete
-        
-        # 清理 git 临时文件
-        find . -name ".git" -type d -prune -exec rm -rf {} \; 2>/dev/null || true
-        
-        echo "Space after download cleaning:"
-        df -h .
-        
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
         
-        # 限制并行编译数，避免内存不足
-        make -j$(($(nproc) / 2 + 1)) || make -j1 || make -j1 V=s
+        # 编译并捕获错误
+        set +e
+        make -j$(nproc) 2>&1 | tee compile.log
+        EXIT_CODE=$?
+        set -e
         
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-        
-    # ========== 空间清理步骤 3: 编译后清理 ==========
-    - name: Clean after compilation
-      if: always()
-      run: |
-        echo "=== Cleaning after compilation ==="
-        cd openwrt
-        
-        # 删除编译中间文件，只保留最终固件
-        rm -rf build_dir/target-*/*/{.pkgdir,.built,*.o,*.a,*.so} 2>/dev/null || true
-        rm -rf staging_dir/target-*/* 2>/dev/null || true
-        rm -rf staging_dir/host/bin 2>/dev/null || true
-        rm -rf tmp/.config* 2>/dev/null || true
-        
-        # 清理日志文件
-        find . -name "*.log" -size +10M -delete 2>/dev/null || true
-        find . -name "*.log.*" -delete 2>/dev/null || true
-        
-        # 清理符号链接和临时文件
-        find . -type l -xtype l -delete 2>/dev/null || true
-        
-        echo "Space after compilation cleaning:"
-        df -h .
-        
-    - name: Check space usage
-      if: (!cancelled())
-      run: |
-        echo "=== Final disk space usage ==="
-        df -hT
-        echo ""
-        echo "=== Largest directories in openwrt ==="
-        du -sh openwrt/* 2>/dev/null | sort -hr | head -10
-
-    - name: List build output (Debug)
-      if: always()
-      run: |
-        echo "=== Check if build produced any files ==="
-        if [ -d "openwrt/bin" ]; then
-          echo "bin directory exists, contents:"
-          ls -la openwrt/bin/
-          echo ""
-          echo "=== Searching for firmware files ==="
-          find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.trx" \) -ls || echo "No firmware files found"
-          echo ""
-          echo "=== Firmware file sizes ==="
-          find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" \) -exec ls -lh {} \; || echo "No firmware files found"
-        else
-          echo "ERROR: openwrt/bin directory not found!"
-          echo "Build likely failed. Check compile step logs."
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "❌ First compile attempt failed, trying single thread..."
+          make -j1 V=s 2>&1 | tee compile_verbose.log
+          EXIT_CODE=$?
         fi
-
-    - name: Upload bin directory (for debugging)
-      uses: actions/upload-artifact@v4
-      if: always() && steps.compile.outputs.status == 'success'
-      with:
-        name: OpenWrt_full_bin_${{ env.FILE_DATE }}
-        path: openwrt/bin
-
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        # 查找固件文件
-        FIRMWARE_FILE=$(find openwrt/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" \) | head -1)
         
-        if [ -z "$FIRMWARE_FILE" ]; then
-          echo "❌ No firmware files found in openwrt/bin!"
-          echo "Available files in bin:"
-          find openwrt/bin -type f 2>/dev/null || echo "  (none)"
+        if [ $EXIT_CODE -ne 0 ]; then
           echo "status=failed" >> $GITHUB_OUTPUT
           exit 1
         fi
         
-        FIRMWARE_DIR=$(dirname "$FIRMWARE_FILE")
-        cd "$FIRMWARE_DIR"
-        rm -rf packages 2>/dev/null || true
-        
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "✅ Found firmware at: $PWD"
-        echo "Firmware files:"
-        ls -la
-
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@v4
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware_RAX3000QY_${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         
-    # ========== 最终清理步骤 ==========
+    - name: Upload compile logs (if failed)
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: compile-logs-${{ env.FILE_DATE }}
+        path: |
+          openwrt/compile.log
+          openwrt/compile_verbose.log
+        retention-days: 7
+
+    # ========== 关键修改部分：智能固件收集 ==========
+    - name: 收集所有固件文件
+      run: |
+        cd openwrt
+        echo "🔍 正在搜索所有编译生成的固件文件..."
+        
+        # 创建统一的固件收集目录
+        mkdir -p $GITHUB_WORKSPACE/firmware-collection
+        
+        # 显示目录结构用于调试
+        echo "📁 bin/targets/ 目录结构："
+        find bin/targets/ -type d 2>/dev/null | head -20 || echo "bin/targets/ 不存在"
+        
+        # 查找并复制所有可能的固件文件
+        echo "📦 查找固件文件..."
+        find bin/targets/ -type f \( \
+          -name "*.bin" -o \
+          -name "*.img" -o \
+          -name "*.ubi" -o \
+          -name "*.tar" -o \
+          -name "*.gz" -o \
+          -name "*.xz" -o \
+          -name "*squashfs*" -o \
+          -name "*sysupgrade*" -o \
+          -name "*factory*" \
+        \) -exec cp -v {} $GITHUB_WORKSPACE/firmware-collection/ \; 2>/dev/null || echo "未找到固件文件"
+        
+        # 同时复制 profiles.json（包含固件信息）
+        find bin/targets/ -name "profiles.json" -exec cp -v {} $GITHUB_WORKSPACE/firmware-collection/ \; 2>/dev/null || true
+        
+        # 列出找到的所有文件
+        echo ""
+        echo "✅ 已收集以下文件："
+        ls -la $GITHUB_WORKSPACE/firmware-collection/ || echo "目录为空"
+        
+        # 统计文件数量
+        count=$(ls -1 $GITHUB_WORKSPACE/firmware-collection/ 2>/dev/null | wc -l)
+        echo ""
+        echo "📊 共找到 $count 个文件"
+        
+        # 如果没找到任何文件，输出详细调试信息
+        if [ $count -eq 0 ]; then
+          echo ""
+          echo "⚠️ 警告：没有找到任何固件文件！"
+          echo ""
+          echo "📁 完整的 bin/targets/ 目录结构："
+          find bin/targets/ -type f 2>/dev/null | head -50 || echo "  (无文件)"
+          echo ""
+          echo "📁 完整的 bin/ 目录结构："
+          find bin/ -type f 2>/dev/null | head -50 || echo "  (无文件)"
+          echo ""
+          echo "📁 编译状态检查："
+          if [ -f ".config" ]; then
+            echo "  .config 存在"
+            grep "CONFIG_TARGET" .config | grep "=y" | head -5
+          else
+            echo "  .config 不存在"
+          fi
+        fi
+        
+    - name: 上传固件（统一收集版）
+      if: success() || failure()  # 即使编译有警告也尝试上传
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt-RAX3000QY-${{ env.FILE_DATE }}
+        path: firmware-collection/
+        retention-days: 7
+        if-no-files-found: warn
+        
+    - name: 上传编译日志和配置（调试用）
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-debug-info-${{ env.FILE_DATE }}
+        path: |
+          openwrt/.config
+          openwrt/feeds.conf.default
+          openwrt/compile.log
+          openwrt/compile_verbose.log
+          openwrt/bin/targets/*/profiles.json
+        retention-days: 7
+        if-no-files-found: warn
+        
     - name: Final cleanup
       if: always()
       run: |
         echo "=== Final cleanup ==="
-        # 删除工作目录释放空间
         sudo rm -rf /workdir
-        sudo rm -rf openwrt
-        
-        # 清理 apt 缓存
         sudo apt clean
-        sudo apt autoremove -y
-        
-        echo "Final disk space:"
         df -h
