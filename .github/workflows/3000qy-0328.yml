@@ -1,0 +1,222 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://githubfast.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
+name: Build RAX30000QY QSDK12.5
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+
+env:  
+  REPO_URL: https://github.com/everything411/qsdk
+  REPO_BRANCH: 12.5.2783.2994
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: QSDK12.5test.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: false  # 改为 false，不上传到 Release
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4  # 升级到 v4，支持 Node.js 24
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt update
+        sudo apt install build-essential clang flex g++ gawk gcc-multilib gettext \
+        git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |        
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    - name: Add custom packages and modify LAN IP
+      run: |
+        cd openwrt
+        
+        # 添加软件包配置
+        cat >> .config << EOF
+        
+        # 添加 WWAN3 相关软件包
+        CONFIG_PACKAGE_wwan=y
+        CONFIG_PACKAGE_comgt=y
+        CONFIG_PACKAGE_comgt-directip=y
+        CONFIG_PACKAGE_comgt-ncm=y
+        CONFIG_PACKAGE_umbim=y
+        CONFIG_PACKAGE_uqmi=y
+        CONFIG_PACKAGE_modemmanager=y
+        CONFIG_PACKAGE_libmbim=y
+        CONFIG_PACKAGE_libqmi=y
+        
+        # 无线安全工具
+        CONFIG_PACKAGE_aircrack-ng=y
+        CONFIG_PACKAGE_airmon-ng=y
+        CONFIG_PACKAGE_hcxdumptool=y
+        CONFIG_PACKAGE_hcxtools=y
+        
+        # Material 主题
+        CONFIG_PACKAGE_luci-theme-material=y
+        CONFIG_PACKAGE_luci-i18n-material-zh-cn=y
+        
+        EOF
+        
+        # 方法1: 修改 config_generate 文件（如果存在）
+        if [ -f "package/base-files/files/bin/config_generate" ]; then
+          echo "Modifying LAN IP in config_generate"
+          sed -i 's/192.168.1.1/192.168.66.1/g' package/base-files/files/bin/config_generate
+        fi
+        
+        # 方法2: 创建 uci-defaults 脚本（最可靠的方法）
+        echo "Creating uci-defaults script to set LAN IP"
+        mkdir -p package/base-files/files/etc/uci-defaults
+        cat > package/base-files/files/etc/uci-defaults/99_set_lan_ip << 'EOF'
+        #!/bin/sh
+        # 设置 LAN IP 为 192.168.66.1
+        uci set network.lan.ipaddr='192.168.66.1'
+        uci commit network
+        # 同时修改 DHCP 网关选项
+        uci set dhcp.lan.dhcp_option='3,192.168.66.1'
+        uci commit dhcp
+        exit 0
+        EOF
+        chmod +x package/base-files/files/etc/uci-defaults/99_set_lan_ip
+        
+        # 方法3: 修改 package/base-files 中的默认配置
+        if [ -f "package/base-files/files/lib/functions/uci-defaults.sh" ]; then
+          echo "Also patching uci-defaults.sh"
+          sed -i 's/192.168.1.1/192.168.66.1/g' package/base-files/files/lib/functions/uci-defaults.sh 2>/dev/null || true
+        fi
+        
+        # 验证修改
+        echo "=== LAN IP modification summary ==="
+        echo "uci-defaults script created:"
+        cat package/base-files/files/etc/uci-defaults/99_set_lan_ip
+        echo ""
+        echo "config_generate IP lines:"
+        grep -n "192.168" package/base-files/files/bin/config_generate 2>/dev/null || echo "config_generate not found or no 192.168 entries"
+        
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: List build output (Debug)
+      if: always()
+      run: |
+        echo "=== Build output directories ==="
+        find openwrt/bin -type d 2>/dev/null || echo "bin directory not found"
+        echo "=== Firmware files ==="
+        find openwrt/bin -name "*.bin" -o -name "*.img" -o -name "*.ubi" 2>/dev/null || echo "No firmware files found"
+        echo "=== Directory structure ==="
+        ls -la openwrt/bin/targets/ 2>/dev/null || echo "Targets directory not found"
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4  # 升级到 v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        # 查找实际的固件目录
+        FIRMWARE_DIR=$(find openwrt/bin/targets -type d -name "generic" 2>/dev/null | head -1)
+        
+        # 如果找不到 generic，尝试查找任何包含固件的目录
+        if [ -z "$FIRMWARE_DIR" ]; then
+          FIRMWARE_DIR=$(find openwrt/bin/targets -type f -name "*.bin" 2>/dev/null | head -1 | xargs dirname)
+        fi
+        
+        if [ -n "$FIRMWARE_DIR" ] && [ -d "$FIRMWARE_DIR" ]; then
+          cd "$FIRMWARE_DIR"
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "Found firmware at: $PWD"
+          echo "Firmware files:"
+          ls -la *.bin 2>/dev/null || ls -la
+        else
+          echo "Firmware directory not found! Checking available paths:"
+          find openwrt/bin/targets -type d 2>/dev/null || echo "No targets found"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4  # 升级到 v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware_RAX3000QY_${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    # 注意：已完全移除 Release 相关步骤
+    # - 不需要 Generate release tag
+    # - 不需要 Upload firmware to release
+    # - 不需要 Remove old Releases
+    # - 不需要 Delete old workflow runs
